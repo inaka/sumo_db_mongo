@@ -22,7 +22,7 @@ all() -> [find_by_sort, find_all_sort].
 
 -spec init_per_suite(config()) -> config().
 init_per_suite(Config) ->
-  ok = test_utils:start_apps(),
+  {ok, _} = application:ensure_all_started(sumo_db_mongo),
   Module = sumo_test_people_mongo,
   sumo_find_test_helper:init_store(Module),
   [{module, Module} | Config].
