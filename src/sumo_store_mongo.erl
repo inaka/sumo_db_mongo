@@ -1,7 +1,7 @@
 %%% @hidden
 %%% @doc MongoDB store implementation.
 %%%
-%%% Copyright 2012 Inaka &lt;hello@inaka.net&gt;
+%%% Copyright 2017 Inaka &lt;hello@inaka.net&gt;
 %%%
 %%% Licensed under the Apache License, Version 2.0 (the "License");
 %%% you may not use this file except in compliance with the License.
@@ -27,18 +27,33 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Exports.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 %%% Public API.
 -export([
-  init/1, create_schema/2, persist/2, find_by/3, find_by/5, find_by/6,
-  find_all/2,  find_all/5, delete_by/3, delete_all/2
+  init/1,
+  create_schema/2,
+  persist/2,
+  fetch/3,
+  find_by/3,
+  find_by/5,
+  find_by/6,
+  find_all/2,
+  find_all/5,
+  delete_by/3,
+  delete_all/2,
+  count/2,
+  count_by/3
 ]).
+
+%%% WorkerPool API
+-export([handle_info/2]).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Types.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
--record(state, {pool:: pid()}).
 
--type state() :: #state{}.
+-type state() :: #{conn := pid(),
+                   ref  := reference()}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% External API.
@@ -46,62 +61,63 @@
 
 -spec init(term()) -> {ok, term()}.
 init(Options) ->
-  % The storage backend key in the options specifies the name of the process
-  % which creates and initializes the storage backend.
   Backend = proplists:get_value(storage_backend, Options),
-  Pool    = sumo_backend_mongo:get_pool(Backend),
-  {ok, #state{pool=Pool}}.
+  Connection = sumo_backend_mongo:get_connection(Backend),
+
+  Ref = monitor(process, Connection),
+
+  {ok, #{conn => Connection, ref => Ref}}.
+
+-spec create_schema(sumo:schema(), state()) -> sumo_store:result(state()).
+create_schema(Schema, #{conn := Connection} = State) ->
+  SchemaName = sumo_internal:schema_name(Schema),
+  Fields = sumo_internal:schema_fields(Schema),
+  lists:foreach(
+    fun(Field) ->
+      Name = sumo_internal:field_name(Field),
+      ok = mc_worker_api:ensure_index(Connection,
+                                      list_to_binary(atom_to_list(SchemaName)),
+                                      {list_to_binary(atom_to_list(Name)), 1})
+    end,
+    Fields
+  ),
+  {ok, State}.
 
 -spec persist(sumo_internal:doc(), state()) ->
   sumo_store:result(sumo_internal:doc(), state()).
-persist(Doc, #state{pool=Pool}=State) ->
+persist(Doc, #{conn := Connection} = State) ->
   DocName = sumo_internal:doc_name(Doc),
   IdField = sumo_internal:id_field_name(DocName),
-  NewId = case sumo_internal:get_field(IdField, Doc) of
-    undefined -> emongo:oid();
-    Id -> emongo:hex2dec(Id)
+  Collection = atom_to_binary(DocName),
+  {Action, NewId} = case sumo_internal:get_field(IdField, Doc) of
+    undefined -> {create, mc_utils:random_nonce(30)};
+    Id        -> {update, Id}
   end,
-  Selector = [{"_id", {oid, NewId}}],
-  NewDoc = sumo_internal:set_field(
-    '_id',
-    {oid, NewId},
-    sumo_internal:set_field(IdField, emongo:dec2hex(NewId), Doc)
-  ),
+
+  NewDoc = sumo_internal:set_field(IdField, NewId, Doc),
   NewDoc2 = sleep(NewDoc),
   Fields = sumo_internal:doc_fields(NewDoc2),
-  ok = emongo:update(
-    Pool, atom_to_list(DocName), Selector,
-    maps:to_list(Fields), true
-  ),
-  {ok, NewDoc, State}.
 
--spec delete_by(sumo:schema_name(), sumo:conditions(), state()) ->
-  sumo_store:result(sumo_store:affected_rows(), state()).
-delete_by(DocName, Conditions, #state{pool = Pool} = State) ->
-  % @TODO: Fix this workaround (it affects performance).
-  % This is a workaround to get the number of docs to be deleted,
-  % before to delete them, since the mongodb client `emongo'
-  % doesn't return this value needed by sumo.
-  % Besides, its is extremely recommended change the mongo client,
-  % because the current one is too old, with lack of maintenance.
-  TotalDocsToBeDeleted = length(emongo:find(
-    Pool,
-    atom_to_list(DocName),
-    build_query(Conditions),
-    [])),
+  ok = do_persist(Action, Connection, Collection, NewId, Fields),
 
-  Query = build_query(transform_conditions(DocName, Conditions)),
-  ok = emongo:delete(Pool,
-                     atom_to_list(DocName),
-                     Query),
-  {ok, TotalDocsToBeDeleted, State}.
+  {ok, wakeup(NewDoc2), State}.
 
+-spec fetch(DocName, Id, State) -> Response when
+  DocName  :: sumo:schema_name(),
+  Id       :: sumo:field_value(),
+  State    :: state(),
+  Response :: sumo_store:result(sumo_internal:doc(), state()).
+fetch(DocName, Id, #{conn := Connection} = State) ->
+  Collection = atom_to_binary(DocName),
+  case mc_worker_api:find_one(Connection, Collection, #{<<"_id">> => Id}) of
+    undefined -> {error, notfound, State};
+    Result    -> {ok, mmap_to_doc(DocName, Result), State}
+  end.
 
--spec delete_all(sumo:schema_name(), state()) ->
-  sumo_store:result(sumo_store:affected_rows(), state()).
-delete_all(DocName, #state{pool=Pool}=State) ->
-  ok = emongo:delete(Pool, atom_to_list(DocName)),
-  {ok, unknown, State}.
+-spec find_by(sumo:schema_name(), sumo:conditions(), state()) ->
+  sumo_store:result([sumo_internal:doc()], state()).
+find_by(DocName, Conditions, State) ->
+  find_by(DocName, Conditions, 0, 0, State).
 
 -spec find_by(sumo:schema_name(),
               sumo:conditions(),
@@ -124,63 +140,38 @@ find_by(DocName,
         SortFields,
         Limit,
         Offset,
-        #state{pool = Pool} = State
+        #{conn := Connection} = State
        ) ->
-  Options = case Offset of
-    0 -> [];
-    Offset -> [{limit, Limit}, {offset, Offset}]
+  Args = case Offset of
+    0 -> #{};
+    Offset -> #{batchsize => Limit, skip => Offset}
   end,
 
-  Options1 = case SortFields of
-               [] -> Options;
-               _  -> [{orderby, SortFields} | Options]
-             end,
+  Sort = case SortFields of
+           [] -> [];
+           _  -> lists:map(fun sort_fields/1, SortFields)
+         end,
 
-  Query = build_query(transform_conditions(DocName, Conditions)),
-  Results = emongo:find(Pool,
-                        atom_to_list(DocName),
-                        Query,
-                        Options1),
+  TranslatedConditions = transform_conditions(DocName, Conditions),
+  Selector = #{<<"$query">> => get_query(TranslatedConditions), <<"$orderby">> => Sort},
+  Collection = atom_to_binary(DocName),
 
-  FoldFun =
-    fun
-      ({<<"_id">>, _FieldValue}, Acc) ->
-        Acc;
-      ({FieldName, FieldValue}, Acc) ->
-        case is_binary(FieldValue) of
-          true ->
-            sumo_internal:set_field(
-              list_to_atom(binary_to_list(FieldName)),
-              binary_to_list(FieldValue),
-              Acc
-             );
-          false ->
-            sumo_internal:set_field(
-              list_to_atom(binary_to_list(FieldName)),
-              FieldValue,
-              Acc
-             )
-        end
+  Results =
+    case mc_worker_api:find(Connection, Collection, Selector, Args) of
+      {ok, Cursor} ->
+        R = case map_size(Args) of
+          0  -> mc_cursor:rest(Cursor);
+          _  -> mc_cursor:next_batch(Cursor)
+        end,
+        mc_cursor:close(Cursor),
+        R;
+      [] ->
+        []
     end,
 
-  Docs =
-    lists:map(
-      fun(Row) ->
-        wakeup(lists:foldl(
-          FoldFun,
-          sumo_internal:new_doc(DocName),
-          Row
-         ))
-      end,
-      Results
-     ),
+  Docs = lists:map(fun (Result) -> mmap_to_doc(DocName, Result) end, Results),
 
   {ok, Docs, State}.
-
--spec find_by(sumo:schema_name(), sumo:conditions(), state()) ->
-  sumo_store:result([sumo_internal:doc()], state()).
-find_by(DocName, Conditions, State) ->
-  find_by(DocName, Conditions, 0, 0, State).
 
 -spec find_all(sumo:schema_name(), state()) ->
   sumo_store:result([sumo_internal:doc()], state()).
@@ -194,93 +185,225 @@ find_all(DocName, State) ->
                state()) ->
   sumo_store:result([sumo_internal:doc()], state()).
 find_all(DocName, SortFields, Limit, Offset, State) ->
-  %% If conditions is empty then no documents are returned.
-  Conditions = [{'_id', not_null}],
-  find_by(DocName, Conditions, SortFields, Limit, Offset, State).
+  find_by(DocName, [], SortFields, Limit, Offset, State).
 
--spec create_schema(sumo:schema(), state()) -> sumo_store:result(state()).
-create_schema(Schema, #state{pool=Pool} = State) ->
-  SchemaName = sumo_internal:schema_name(Schema),
-  Fields = sumo_internal:schema_fields(Schema),
-  lists:foreach(
-    fun(Field) ->
-      create_field(Field),
-      Name = sumo_internal:field_name(Field),
-      ok = emongo:ensure_index(
-        Pool, atom_to_list(SchemaName), [{atom_to_list(Name), 1}])
-    end,
-    Fields
-  ),
-  {ok, State}.
+-spec delete_by(sumo:schema_name(), sumo:conditions(), state()) ->
+  sumo_store:result(sumo_store:affected_rows(), state()).
+delete_by(DocName, Conditions, #{conn := Connection} = State) ->
+  Collection = atom_to_binary(DocName),
+  TranslatedConditions = transform_conditions(DocName, Conditions),
+  Selector = get_query(TranslatedConditions),
 
-create_field(Field) ->
-  Attrs = sumo_internal:field_attrs(Field),
-  lists:foldl(
-    fun(Attr, Acc) ->
-      case create_index(Attr) of
-        none -> Acc;
-        IndexProp -> [IndexProp|Acc]
-      end
-    end,
-    [],
-    Attrs
-  ).
+  {true, #{<<"n">> := Count}} = mc_worker_api:delete(Connection, Collection, Selector),
 
-create_index(index) ->
-  none;
+  {ok, Count, State}.
 
-create_index(unique) ->
-  {unique, 1};
+-spec delete_all(sumo:schema_name(), state()) ->
+  sumo_store:result(sumo_store:affected_rows(), state()).
+delete_all(DocName, State) ->
+  delete_by(DocName, [], State).
 
-create_index(id) ->
-  {unique, 1};
+-spec count(DocName, State) -> Response when
+  DocName  :: sumo:schema_name(),
+  State    :: state(),
+  Response :: sumo_store:result(non_neg_integer(), state()).
+count(DocName, State) ->
+  count_by(DocName, [], State).
 
-create_index(_Attr) ->
-  none.
+
+-spec count_by(DocName, Conditions, State) -> Response when
+  DocName    :: sumo:schema_name(),
+  Conditions :: sumo:conditions(),
+  State      :: state(),
+  Response   :: sumo_store:result(non_neg_integer(), state()).
+count_by(DocName, Conditions, #{conn := Connection} = State) ->
+  Collection = atom_to_binary(DocName),
+  TranslatedConditions = transform_conditions(DocName, Conditions),
+  Selector = get_query(TranslatedConditions),
+  Count = mc_worker_api:count(Connection, Collection, Selector),
+
+  {ok, Count, State}.
+
+-spec handle_info(term(), state()) -> {noreply, state()}.
+handle_info({'DOWN', Ref, process, Connection, _},
+            #{conn := Connection, ref := Ref} = State) ->
+  {stop, normal, State};
+handle_info(_Msg, State) ->
+  {noreply, State}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Private API.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
--spec build_query(sumo:conditions()) -> iodata().
-build_query(Exprs) when is_list(Exprs) ->
-  lists:flatmap(fun build_query/1, Exprs);
-build_query({'and', Exprs}) ->
-  WrappedExpr = [[Expr] || Expr <- build_query(Exprs)],
-  [{<<"$and">>, {array, WrappedExpr}}];
-build_query({'or', Exprs}) ->
-  WrappedExpr = [[Expr] || Expr <- build_query(Exprs)],
-  [{<<"$or">>, {array, WrappedExpr}}];
-build_query({'not', Expr}) ->
-  [{<<"$not">>, build_query(Expr)}];
+%% @private
+sleep(Doc) ->
+  sumo_utils:doc_transform(fun sleep_fun/4, Doc).
 
-build_query({_Name1, _Op, Name2} = Expr) when is_atom(Name2) ->
-  throw({unsupported_expression, Expr});
-build_query({Name, '/=', Value}) ->
-  [{Name, [{<<"$ne">>, Value}]}];
-build_query({Name, '==', Value}) ->
-  [{Name, Value}];
-build_query({Name, '=<', Value}) ->
-  [{Name, [{<<"$lte">>, Value}]}];
-build_query({Name, '>=', Value}) ->
-  [{Name, [{<<"$gte">>, Value}]}];
-build_query({Name, '<', Value}) ->
-  [{Name, [{<<"$lt">>, Value}]}];
-build_query({Name, '>', Value}) ->
-  [{Name, [{<<"$gt">>, Value}]}];
-build_query({Name, 'like', Value}) ->
+%% @private
+sleep_fun(FieldType, _, FieldValue, _) when FieldType == date;
+                                            FieldType == datetime ->
+  case {FieldType, sumo_utils:is_datetime(FieldValue)} of
+    {datetime, true} -> iso8601:format(FieldValue);
+    {date, true}     -> iso8601:format({FieldValue, {0, 0, 0}});
+    _                -> FieldValue
+  end;
+sleep_fun(custom, _, FieldValue, FieldAttrs) ->
+  Type = sumo_utils:keyfind(type, FieldAttrs, custom),
+  sleep_custom(FieldValue, Type);
+sleep_fun(_, _, FieldValue, _) ->
+  FieldValue.
+
+%% @private
+sleep_custom(FieldValue, FieldType) ->
+  case lists:member(FieldType, [array, bin_data, object]) of
+    true -> base64:encode(term_to_binary(FieldValue));
+    _    -> FieldValue
+  end.
+
+%% @private
+wakeup(Doc) ->
+  sumo_utils:doc_transform(fun wakeup_fun/4, Doc).
+
+%% @private
+wakeup_fun(FieldType, _, FieldValue, _) when FieldType =:= datetime;
+                                             FieldType =:= date ->
+  case {FieldType, iso8601:is_datetime(FieldValue)} of
+    {datetime, true} -> iso8601:parse(FieldValue);
+    {date, true}     -> {Date, _} = iso8601:parse(FieldValue), Date;
+    _                -> FieldValue
+  end;
+wakeup_fun(custom, _, FieldValue, FieldAttrs) ->
+  Type = sumo_utils:keyfind(type, FieldAttrs, custom),
+  wakeup_custom(FieldValue, Type);
+wakeup_fun(_, _, FieldValue, _) ->
+  FieldValue.
+
+%% @private
+wakeup_custom(FieldValue, FieldType) ->
+  case lists:member(FieldType, [bin_data, array, object]) of
+    true -> binary_to_term(base64:decode(FieldValue));
+    _    -> FieldValue
+  end.
+
+%% @private
+do_persist(update, Connection, Collection, Id, Fields) ->
+  Command = #{<<"$set">> => Fields#{<<"_id">> => Id}},
+  {true, _} = mc_worker_api:update(Connection, Collection, #{<<"_id">> => Id}, Command),
+  ok;
+do_persist(create, Connection, Collection, Id, Fields) ->
+  {{true, _}, _} = mc_worker_api:insert(Connection, Collection, Fields#{<<"_id">> => Id}),
+  ok.
+
+%% @private
+atom_to_binary(DocName) ->
+  list_to_binary(atom_to_list(DocName)).
+
+%% @private
+sort_fields({Field, desc}) ->
+  #{atom_to_binary(Field) => -1};
+sort_fields({Field, asc}) ->
+  #{atom_to_binary(Field) => 1}.
+
+%% @private
+mmap_to_doc(DocName, MongoMap) ->
+  wakeup(sumo_internal:new_doc(DocName, mmap_to_map(MongoMap))).
+
+%% @private
+mmap_to_map(MongoMap) ->
+  lists:foldl(fun({K, V}, Acc) ->
+      maps:put(sumo_utils:to_atom(K), V, Acc)
+  end, #{}, maps:to_list(MongoMap)).
+
+%% @private
+get_query(Conditions) ->
+  lists:foldl(fun condition/2, #{}, Conditions).
+
+%% @private
+condition({'and', Conditions}, _Query) ->
+  get_query(Conditions);
+condition({'or', Conditions}, Query) ->
+  Query#{<<"$or">> => get_or_query(Conditions)};
+condition({'not', {FieldName, Operator, Value}}, Query) ->
+  MOperator = mongo_operator(Operator, Value),
+  Query#{atom_to_binary(FieldName) => #{<<"$not">> => MOperator}};
+condition({FieldName, Operator, Value}, Query) ->
+  MOperator = mongo_operator(Operator, Value),
+  add_condition(atom_to_binary(FieldName), MOperator, Query);
+condition({FieldName, 'null'}, Query) ->
+  add_condition(atom_to_binary(FieldName), undefined, Query);
+condition({FieldName, 'not_null'}, Query) ->
+  add_condition(atom_to_binary(FieldName), #{<<"$ne">> => undefined}, Query);
+condition({FieldName, FieldValue}, Query) ->
+  add_condition(atom_to_binary(FieldName), FieldValue, Query).
+
+%% @private
+add_condition(Field, Value, Map) ->
+  case maps:get(Field, Map, undefined) of
+    undefined ->
+      Map#{Field => Value};
+    ActualValue when is_map(ActualValue) ->
+      Map#{Field => resolve_conflicts(Value, ActualValue)};
+    ActualValue when is_list(ActualValue) ->
+      Map#{Field => [Value | ActualValue]};
+    ActualValue ->
+      Map#{Field => [Value, ActualValue]}
+  end.
+
+%% @private
+resolve_conflicts(#{<<"$ne">> := Value} = NewOperator, ActualMap) ->
+  case maps:get(<<"$ne">>, ActualMap, undefined) of
+    undefined ->
+      maps:merge(ActualMap, NewOperator);
+    ActualNEValue ->
+      case maps:get(<<"$nin">>, ActualMap, undefined) of
+        undefined ->
+          ActualMap#{<<"$nin">> => [Value, ActualNEValue]};
+        ActualNINValue ->
+          ActualMap#{<<"$nin">> => [Value | ActualNINValue]}
+      end
+  end;
+resolve_conflicts(NewOperator, ActualMap) ->
+  maps:merge(ActualMap, NewOperator).
+
+%% @private
+mongo_operator('<', Value) ->
+  #{<<"$lt">> => Value};
+mongo_operator('>', Value) ->
+  #{<<"$gt">> => Value};
+mongo_operator('==', Value) ->
+  Value;
+mongo_operator('=<', Value) ->
+  #{<<"$lte">> => Value};
+mongo_operator('>=', Value) ->
+  #{<<"$gte">> => Value};
+mongo_operator('/=', Value) ->
+  #{<<"$ne">> => Value};
+mongo_operator('like', Value) ->
   Regex = like_to_regex(Value),
-  [{Name, {regexp, Regex, "i"}}];
-build_query({_, Op, _})  ->
-  sumo_internal:check_operator(Op);
+  #{<<"$regex">> => Regex}.
 
-build_query({Name, 'null'}) ->
-  [{Name, undefined}];
-build_query({Name, 'not_null'}) ->
-  [{Name, [{<<"$ne">>, undefined}]}];
-build_query({Name, Value}) ->
-  [{Name, Value}].
+%% @private
+get_or_query(Conditions) ->
+  % Each condition should be in a list in order to use get_query/1
+  PreConditions = lists:map(fun(Condition) -> [Condition] end, Conditions),
+  lists:map(fun get_query/1, PreConditions).
 
+%% @private
+transform_conditions(DocName, Conditions) ->
+  sumo_utils:transform_conditions(
+    fun validate_date/1, DocName, Conditions, [date, datetime]).
+
+%% @private
+validate_date({FieldType, _, FieldValue}) ->
+  case {FieldType, sumo_utils:is_datetime(FieldValue)} of
+    {datetime, true} ->
+      iso8601:format(FieldValue);
+    {date, true} ->
+      DateTime = {FieldValue, {0, 0, 0}},
+      iso8601:format(DateTime)
+  end.
+
+%% @private
 like_to_regex(Like) ->
   Bin = sumo_utils:to_bin(Like),
   LikeList = sumo_utils:to_list(Like),
@@ -292,51 +415,4 @@ like_to_regex(Like) ->
   case lists:last(LikeList) of
     $% -> Regex1;
     _ -> <<Regex1/binary, "$">>
-  end.
-
-%% @private
-sleep(Doc) ->
-  sumo_utils:doc_transform(fun sleep_fun/1, Doc).
-
-%% @private
-sleep_fun({date, _, FieldValue}) ->
-  case sumo_utils:is_datetime(FieldValue) of
-    true -> {FieldValue, {0, 0, 0}};
-    _    -> FieldValue
-  end;
-sleep_fun({_, _, FieldValue}) ->
-  FieldValue.
-
-%% @private
-wakeup(Doc) ->
-  sumo_utils:doc_transform(fun wakeup_fun/1, Doc).
-
-%% @private
-wakeup_fun({datetime, _, {_, _, _} = FieldValue}) ->
-  calendar:now_to_universal_time(FieldValue);
-wakeup_fun({date, _, {_, _, _} = FieldValue}) ->
-  {Date, _} = calendar:now_to_universal_time(FieldValue),
-  Date;
-%% Matches `text' type fields that were saved with `undefined' value and
-%% avoids being processed by the next clause that will return it as a
-%% binary (`<<"undefined">>') instead of atom as expected.
-wakeup_fun({_, _, undefined}) ->
-  undefined;
-wakeup_fun({string, _, FieldValue}) ->
-  sumo_utils:to_bin(FieldValue);
-wakeup_fun({text, _, FieldValue}) ->
-  sumo_utils:to_bin(FieldValue);
-wakeup_fun({_, _, FieldValue}) ->
-  FieldValue.
-
-%% @private
-transform_conditions(DocName, Conditions) ->
-  sumo_utils:transform_conditions(
-    fun validate_date/1, DocName, Conditions, [date, datetime]).
-
-%% @private
-validate_date({FieldType, _, FieldValue}) ->
-  case {FieldType, sumo_utils:is_datetime(FieldValue)} of
-    {datetime, true} -> FieldValue;
-    {date, true}     -> {FieldValue, {0, 0, 0}}
   end.

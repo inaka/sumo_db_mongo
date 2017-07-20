@@ -10,4 +10,8 @@ rel/example_project
 .rebar
 .erlang.mk/
 logs/
+log/
 sumo_db_mongo.d
+_build
+*_plt
+.DS_Store

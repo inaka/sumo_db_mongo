@@ -1,12 +1,12 @@
 {application, sumo_db_mongo, [
   {description, "SumoDB MongoDB Adapter"},
   {id, "sumo_db_mongo"},
+  {vsn, "0.1.0"},
   {registered, []},
   {applications, [
     kernel,
     stdlib,
-    lager,
-    emongo,
+    mongodb,
     sumo_db
   ]},
   {modules, []},
