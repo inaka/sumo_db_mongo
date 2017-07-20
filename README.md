@@ -3,8 +3,18 @@
 # About
 
 This is the [MongoDB](https://www.mongodb.org/downloads) adapter for [sumo_db](https://github.com/inaka/sumo_db) that works
-for **2.x** versions.
+for **3.x** versions.
 
+## Contact Us
+
+For **questions** or **general comments** regarding the use of this library,
+please use our public [hipchat room](http://inaka.net/hipchat).
+
+If you find any **bugs** or have a **problem** while using this library, please
+[open an issue](https://github.com/inaka/sumo_db_mongo/issues/new) in this repo (or a pull request :)).
+
+And you can check all of our open-source projects at
+[inaka.github.io](http://inaka.github.io)
 
 ## MongoDB
 
@@ -18,47 +28,16 @@ To install **MongoDB** please follow the instructions in this link:
 Due to the fact that **MongoDB** comes with default configuration, we need to
 change some parameters required by `sumo_db`.
 
-If `sumo` is giving you an error like *exit with reason bad return value: <<"auth failed">> in context start_error*,
-it means that your current `MongoDB` installation is using the
-[SCRAM-SHA-1](https://docs.mongodb.org/manual/core/security-scram-sha-1/#authentication-scram-sha-1)
-authentication mechanism, so we need to change it to use
-[MongoDB-CR](https://docs.mongodb.org/manual/core/security-mongodb-cr/) following these steps:
-
-```javascript
-//NOTE: USE REMOVE COMMANDS IN TEST DB ONLY, IF IN PRODUCTION USE UPDATE.
-mongo
-use admin
-db.system.users.remove({})    <== removing all users
-db.system.version.remove({}) <== removing current version
-db.system.version.insert({ "_id" : "authSchema", "currentVersion" : 3  })
-
-//Now restart the mongod and create new user then it should work fine.
-
-// Taken from http://stackoverflow.com/a/31476552/2969462
-```
-
 ## Getting Started
 
-To start use `sumo_db` with this MongoDB adapter `sumo_db_mongo` is pretty easy, you only has to
+To start using `sumo_db` with this MongoDB adapter `sumo_db_mongo` is pretty easy, you only has to
 follow these steps:
 
- 1. Add `sumo_db` and `sumo_db_mongo` as dependencies in your project.
-
-Using **erlang.mk**:
-
-```erlang
-DEPS = sumo_db sumo_db_mongo
-
-dep_sumo_db      = git https://github.com/inaka/sumo_db.git      0.5.0
-dep_sumo_db_mongo = git https://github.com/inaka/sumo_db_mongo.git 0.0.1
-```
-
-Using **Rebar**:
+ 1. Add `sumo_db_mongo` as dependency in your `rebar.config` file.
 
 ```erlang
 {deps, [
-  {sumo_db, {git, "https://github.com/inaka/sumo_db.git", {tag, "0.5.0"}}},
-  {sumo_db_mongo, {git, "https://github.com/inaka/sumo_db_mongo.git", {tag, "0.0.1"}}}
+  {sumo_db_mongo, {git, "git://github.com/inaka/sumo_db_mongo.git", {branch, "master"}}}
 ]}.
 ```
 
@@ -70,61 +49,52 @@ Using **Rebar**:
 
  4. Now you can run your app and start using `sumo` from there.
 
+### Configuration
+In order to connect with a _MongoDB_ database we have to set some configuration parameters in the config file.
+
+```erlang
+...
+{sumo_db,
+[
+ {wpool_opts, [{overrun_warning, 100}]},
+ {log_queries, true},
+ {query_timeout, 30000},
+ {storage_backends,
+  [{sumo_test_backend_mongo,
+    sumo_backend_mongo,
+    [
+     {login,    "root"},
+     {password, "password"},
+     {host,     "127.0.0.1"},
+     {port,     27017},
+     {database, "sumo_test"}
+     ]
+   }]
+ }
+...
+```
+
+- `login` and `password`. The credentials in order to connect to a database. By default _MongoDB_ has no authentication enabled.
+- `host` is the host. By default is "127.0.0.1"
+- `port` is the port. By default is 27017
+- `database` the name of the database. *Mandatory*
+
 ### Running sumo from Erlang console
 
 Start the Erlang console, adding the path to your beams and config file
 
-    $ erl -pa ebin deps/*/ebin -config tests/test.config
+    $ erl -pa _build/default/lib/*/ebin -pa _build/testib/sumo_db_mongo/test -config test/test.config -s sumo_db_mongo
 
 Within the console:
 
 ```erlang
-> application:ensure_all_started(sumo_db_mongo).
-15:18:39.914 [info] Application lager started on node nonode@nohost
-15:18:39.964 [info] Application sasl started on node nonode@nohost
-15:18:39.976 [info] Application emongo started on node nonode@nohost
-15:18:39.995 [info] Application crypto started on node nonode@nohost
-15:18:40.005 [info] Creating wpool ETS table
-15:18:40.006 [info] Application worker_pool started on node nonode@nohost
-15:18:40.010 [info] Application quickrand started on node nonode@nohost
-15:18:40.011 [info] Application uuid started on node nonode@nohost
-15:18:40.150 [info] Application sumo_db started on node nonode@nohost
-15:18:40.155 [info] Application sumo_db_mongo started on node nonode@nohost
-{ok,[syntax_tools,compiler,goldrush,lager,sasl,emongo,
-     crypto,worker_pool,quickrand,uuid,sumo_db,sumo_db_mongo]}
-
-% from here you can start using sumo
-
-> sumo:find_all(sumo_test_people_mongo).
+Eshell V8.3  (abort with ^G)
+1> sumo:find_all(users).
 []
 ```
 
-
 ## Running Tests
 
-- Create a test database
-```javascript
-use sumo_test
-```
-- Create an user to access that DB.
-```javascript
-db.createUser({user: "root", pwd: "pass", roles: [{role: "userAdmin", db: "sumo_test"}]})
-```
-- Or use defaults and configure it on `test/test.config` file.
+First we need to add the connection parameters to `test/test.config` file as we described in *Configuration* section. After that just run:
 
-
-## TODO
-
-- Make this adapter work with MongoDB **3.x**
-
-
-## Contact Us
-
-For **questions** or **general comments** regarding the use of this library,
-please use our public [hipchat room](http://inaka.net/hipchat).
-
-If you find any **bugs** or have a **problem** while using this library, please
-[open an issue](https://github.com/inaka/sumo_db_mongo/issues/new) in this repo (or a pull request :)).
-
-And you can check all of our open-source projects at
-[inaka.github.io](http://inaka.github.io)
+      rebar3 ct

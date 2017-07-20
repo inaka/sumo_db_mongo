@@ -1,0 +1,30 @@
+{"1.1.0",
+[{<<"bson">>,
+  {git,"git://github.com/comtihon/bson-erlang",
+       {ref,"14308ab927cfa69324742c3de720578094e0bb19"}},
+  1},
+ {<<"iso8601">>,{pkg,<<"inaka_iso8601">>,<<"1.1.2">>},0},
+ {<<"mongodb">>,
+  {git,"git://github.com/comtihon/mongodb-erlang.git",
+       {ref,"ee9d10a842a308a2727560a04f5c6c56f94c6462"}},
+  0},
+ {<<"pbkdf2">>,
+  {git,"git://github.com/comtihon/erlang-pbkdf2.git",
+       {ref,"7076584f5377e98600a7e2cb81980b2992fb2f71"}},
+  1},
+ {<<"poolboy">>,
+  {git,"git://github.com/comtihon/poolboy.git",
+       {ref,"04ea8a5479b273a052942755ebdc42c9e318d907"}},
+  1},
+ {<<"quickrand">>,{pkg,<<"quickrand">>,<<"1.5.4">>},2},
+ {<<"sumo_db">>,{pkg,<<"sumo_db">>,<<"0.7.5">>},0},
+ {<<"uuid">>,{pkg,<<"uuid_erl">>,<<"1.5.4">>},1},
+ {<<"worker_pool">>,{pkg,<<"worker_pool">>,<<"2.3.0">>},1}]}.
+[
+{pkg_hash,[
+ {<<"iso8601">>, <<"6D84BBA9641FA39802E6B53C57E0B61B2F61BF8E81C112356B57BE8DA31DE771">>},
+ {<<"quickrand">>, <<"47ADD4755CC5F209CBEFFD6F47C84061196CD7FAD99FD8FD12418EB0D06B939D">>},
+ {<<"sumo_db">>, <<"67914B17681B9F8734636F591AB1B03E8DB842575F7BBD6749E8D68396832EB7">>},
+ {<<"uuid">>, <<"06240EFF3EAF013CC22274689B0C1FF6345645EE5D47A9E4ED7545EEB7698B23">>},
+ {<<"worker_pool">>, <<"F401FD82A6A02333F4326B144A1EE759EEDEA20411F4283A3F3195BD62A2E445">>}]}
+].
