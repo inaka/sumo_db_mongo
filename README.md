@@ -120,9 +120,6 @@ db.createUser({user: "root", pwd: "pass", roles: [{role: "userAdmin", db: "sumo_
 
 ## Contact Us
 
-For **questions** or **general comments** regarding the use of this library,
-please use our public [hipchat room](http://inaka.net/hipchat).
-
 If you find any **bugs** or have a **problem** while using this library, please
 [open an issue](https://github.com/inaka/sumo_db_mongo/issues/new) in this repo (or a pull request :)).
 
